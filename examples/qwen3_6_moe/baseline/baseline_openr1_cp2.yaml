@@ -1,0 +1,189 @@
+# Qwen3.6-35B-A3B L8 baseline — the vendored recipe's own parallel block.
+#
+# Generated from hyper_parallel/models/qwen3_6_moe/recipes/train_online.yaml by
+# rewriting only the fields a reduced-model baseline is allowed to vary:
+#   accelerator.{ep,cp}_size 2/2, fsdp_config.edp_shard_size 4  (unchanged)
+#   activation_checkpoint.mode full                             (unchanged)
+#   dataset.data_transform.max_seq_len 4096                     (unchanged)
+#   training.train_iters 100                                    (unchanged)
+#   model/data/checkpoint/profiler paths -> this deployment
+#   model.load_base_model true (from_pretrained default), training.logging_steps 1
+#   debug.check_nan_inf restored to the vendored false
+# Everything else, including all three plan_overrides, is copied verbatim.
+#
+# Dataset: open-r1/OpenR1-Math-220k, config default, split train, shard 0 of 10
+#   sha256 ccc3a95e4875dc4cff9bec2f0fb1c93e4c9cbb24fb24853fd0b96c416e1a263c
+# Parallel: EP2 x CP2 x EDP4 on 8 ranks (dp_size=4, fsdp shard group=8).
+#
+# Override paths with the launch script instead of editing this file.
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /root/s0-l8/model-l8-real
+  ignore_mismatched_sizes: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+  load_base_model: true
+training:
+  train_iters: 100
+  train_samples: null
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+  logging_steps: 1
+accelerator:
+  tp_size: 1
+  cp_size: 2
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+fsdp_config:
+  wrapper_class:
+  - Qwen3_5MoeDecoderLayer
+  - Embedding
+  dp_shard_size: 8
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+  edp_shard_size: 4
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+plan_overrides:
+- match: '*.linear_attn'
+  replace:
+    kind: module
+    source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet
+    exact_type: true
+    implementation:
+      _target_: hyper_parallel.components.modules.GatedDeltaNet
+      backend: triton
+      conv_backend: triton
+      ulysses_degree: null
+- match: '*.mlp.experts'
+  replace:
+    kind: module
+    source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts
+    exact_type: true
+    implementation:
+      _target_: hyper_parallel.components.modules.GroupedExperts
+- match: '*.self_attn.forward'
+  when: cp
+  replace:
+    kind: method
+    implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_ulysses_cp_wrapper
+mixed_precision:
+  enabled: false
+activation_checkpoint:
+  mode: full
+activation_swap: none
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+dataset:
+  model_assets:
+    chat_template: tokenizer
+    chat_template_kwargs:
+      enable_thinking: true
+      reasoning_effort: medium
+      preserve_thinking: true
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /root/s0-l8/model-l8-real
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: sharegpt
+    text_keys: messages
+    max_seq_len: 4096
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: /root/s0-l8/data/openr1-math-220k-train-00000.parquet
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: null
+    create_attention_mask_in_dataloader: false
+    labels_are_shifted: true
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: dense
+  sampler_type: cyclic
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+loss_fn:
+  _target_: hyper_parallel.components.losses.ChunkedCausalLMLoss
+  chunk_size: 1024
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  no_decay_params:
+  - bias
+  - norm
+  - ln_
+  adamw_config:
+    adamw_lr: 1.0e-05
+    adamw_weight_decay: 0.01
+    adamw_betas:
+    - 0.9
+    - 0.95
+    adamw_eps: 1.0e-08
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-05
+    lr_warmup_steps: 0
+    min_lr: 1.0e-06
+checkpoint:
+  save_ckpt: false
+  save_hf_weights: false
+  checkpoint_dir: ./outputs/baseline_openr1_cp2/checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: false
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+debug:
+  log_first_rendered_template: true
+  check_nan_inf: false
+  check_dataset: null
+profiler:
+  enable: false
+  start_step: 3
+  stop_step: 4
+  output_path: ./outputs/baseline_openr1_cp2/profiling
+  memory: false
+  with_stack: false
+  rank_ids:
+  - 0
